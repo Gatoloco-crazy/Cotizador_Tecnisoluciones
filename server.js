@@ -2,27 +2,13 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
+const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
 
 const ROOT = __dirname;
-loadEnvironment();
 
-const PORT = Number(process.env.PORT || 3000);
-const PUBLIC_DIR = path.join(ROOT, 'public');
-const DATA_DIR = path.join(ROOT, 'data');
-const FALLBACK_FILE = path.join(DATA_DIR, 'local-data.json');
-const DB_CONFIG = {
-  host: process.env.DB_HOST || '127.0.0.1',
-  port: Number(process.env.DB_PORT || 3306),
-  user: process.env.DB_USER || process.env.DB_USERNAME || 'root',
-  password: process.env.DB_PASSWORD || '',
-  database: process.env.DB_NAME || process.env.DB_DATABASE || 'TECNISOLUCIONES_BS',
-};
-
-let mysql;
-let pool;
-let databaseMode = 'local';
-
-function loadEnvironment() {
+// Cargar variables de entorno
+(function loadEnvironment() {
   const envPath = path.join(ROOT, '.env');
   if (!fs.existsSync(envPath)) return;
   for (const line of fs.readFileSync(envPath, 'utf8').split(/\r?\n/)) {
@@ -34,7 +20,237 @@ function loadEnvironment() {
     const raw = value.slice(separator + 1).trim();
     process.env[key] = raw.replace(/^(['"])(.*)\1$/, '$2');
   }
+})();
+
+const PORT = Number(process.env.PORT || 3000);
+const PUBLIC_DIR = path.join(ROOT, 'public');
+const DATA_DIR = path.join(ROOT, 'data');
+const FALLBACK_FILE = path.join(DATA_DIR, 'local-data.json');
+const USUARIOS_JSON_PATH = path.join(ROOT, 'database', 'usuarios.json');
+const DB_CONFIG = {
+  host: process.env.DB_HOST || '127.0.0.1',
+  port: Number(process.env.DB_PORT || 3306),
+  user: process.env.DB_USER || process.env.DB_USERNAME || 'root',
+  password: process.env.DB_PASSWORD || '',
+  database: process.env.DB_NAME || process.env.DB_DATABASE || 'TECNISOLUCIONES_BS',
+};
+
+// ============================================
+// SISTEMA DE AUTENTICACIÓN Y SEGURIDAD
+// ============================================
+
+// Mapa de sesiones en memoria: { session_id: { usuario, expiraEn } }
+const sesionesActivas = new Map();
+
+// Duración de sesión en milisegundos (24 horas)
+const SESION_DURACION_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Carga usuarios desde archivo JSON local
+ * @returns {Array} Lista de usuarios
+ */
+function cargarUsuariosJSON() {
+  try {
+    if (!fs.existsSync(USUARIOS_JSON_PATH)) {
+      // Crear archivo si no existe
+      const dbDir = path.dirname(USUARIOS_JSON_PATH);
+      if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
+      fs.writeFileSync(USUARIOS_JSON_PATH, JSON.stringify({ usuarios: [] }, null, 2));
+      return [];
+    }
+    const data = JSON.parse(fs.readFileSync(USUARIOS_JSON_PATH, 'utf8'));
+    return data.usuarios || [];
+  } catch {
+    return [];
+  }
 }
+
+/**
+ * Guarda usuarios en archivo JSON local
+ * @param {Array} usuarios - Lista de usuarios a guardar
+ */
+function guardarUsuariosJSON(usuarios) {
+  const dbDir = path.dirname(USUARIOS_JSON_PATH);
+  if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
+  fs.writeFileSync(USUARIOS_JSON_PATH, JSON.stringify({ usuarios }, null, 2));
+}
+
+/**
+ * Busca un usuario por correo en MySQL o JSON
+ * @param {string} correo - Correo del usuario
+ * @returns {Promise<Object|null>} Usuario encontrado o null
+ */
+async function buscarUsuarioPorCorreo(correo) {
+  if (pool && databaseMode === 'mysql') {
+    try {
+      const [rows] = await pool.query('SELECT id, correo, password_hash, creado_en FROM usuarios WHERE correo = ?', [correo]);
+      if (rows.length > 0) return rows[0];
+    } catch {
+      // Si falla MySQL, intentar con JSON
+    }
+  }
+  // Fallback a JSON
+  const usuarios = cargarUsuariosJSON();
+  return usuarios.find(u => u.correo.toLowerCase() === correo.toLowerCase()) || null;
+}
+
+/**
+ * Crea un nuevo usuario administrador
+ * @param {string} correo - Correo del usuario
+ * @param {string} password - Contraseña en texto plano
+ * @returns {Promise<Object>} Usuario creado
+ * @throws {Error} Si el usuario ya existe o hay error
+ */
+async function crearUsuarioAdmin(correo, password) {
+  // Verificar si ya existe
+  const existente = await buscarUsuarioPorCorreo(correo);
+  if (existente) {
+    throw new Error('Ya existe un usuario con ese correo.');
+  }
+
+  // Generar hash con bcrypt (salt 10)
+  const saltRounds = 10;
+  const passwordHash = await bcrypt.hash(password, saltRounds);
+
+  if (pool && databaseMode === 'mysql') {
+    try {
+      // Asegurar que la tabla existe
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS usuarios (
+          id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+          correo VARCHAR(120) NOT NULL,
+          password_hash VARCHAR(255) NOT NULL,
+          creado_en TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (id),
+          UNIQUE KEY uq_usuarios_correo (correo)
+        ) ENGINE=InnoDB;
+      `);
+      
+      const [result] = await pool.execute(
+        'INSERT INTO usuarios (correo, password_hash) VALUES (?, ?)',
+        [correo, passwordHash]
+      );
+      
+      return { id: result.insertId, correo, creado_en: new Date().toISOString() };
+    } catch (error) {
+      // Si falla MySQL, usar JSON
+    }
+  }
+
+  // Guardar en JSON
+  const usuarios = cargarUsuariosJSON();
+  const nuevoUsuario = {
+    id: usuarios.length > 0 ? Math.max(...usuarios.map(u => u.id)) + 1 : 1,
+    correo,
+    password_hash: passwordHash,
+    creado_en: new Date().toISOString(),
+  };
+  usuarios.push(nuevoUsuario);
+  guardarUsuariosJSON(usuarios);
+  return nuevoUsuario;
+}
+
+/**
+ * Valida las credenciales de un usuario
+ * @param {string} correo - Correo del usuario
+ * @param {string} password - Contraseña en texto plano
+ * @returns {Promise<Object|null>} Usuario si es válido, null si no
+ */
+async function validarCredenciales(correo, password) {
+  const usuario = await buscarUsuarioPorCorreo(correo);
+  if (!usuario) return null;
+
+  const passwordValido = await bcrypt.compare(password, usuario.password_hash);
+  if (!passwordValido) return null;
+
+  return usuario;
+}
+
+/**
+ * Genera un token de sesión único
+ * @returns {string} Token de sesión
+ */
+function generarTokenSesion() {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+/**
+ * Crea una nueva sesión para un usuario
+ * @param {string} token - Token de sesión
+ * @param {Object} usuario - Datos del usuario
+ * @returns {Object} Información de la sesión
+ */
+function crearSesion(token, usuario) {
+  const expiraEn = Date.now() + SESION_DURACION_MS;
+  const sesion = {
+    usuario: { id: usuario.id, correo: usuario.correo },
+    expiraEn,
+  };
+  sesionesActivas.set(token, sesion);
+  return sesion;
+}
+
+/**
+ * Limpia sesiones expiradas del mapa
+ */
+function limpiarSesionesExpiradas() {
+  const ahora = Date.now();
+  for (const [token, sesion] of sesionesActivas.entries()) {
+    if (sesion.expiraEn < ahora) {
+      sesionesActivas.delete(token);
+    }
+  }
+}
+
+// Limpiar sesiones expiradas cada hora
+setInterval(limpiarSesionesExpiradas, 60 * 60 * 1000);
+
+/**
+ * Extrae el session_id de las cookies de la petición
+ * @param {Object} req - Petición HTTP
+ * @returns {string|null} Session ID o null si no existe
+ */
+function obtenerSessionIdDeCookies(req) {
+  const cookieHeader = req.headers.cookie;
+  if (!cookieHeader) return null;
+
+  const cookies = cookieHeader.split(';').map(c => c.trim());
+  for (const cookie of cookies) {
+    if (cookie.startsWith('session_id=')) {
+      return cookie.slice('session_id='.length);
+    }
+  }
+  return null;
+}
+
+/**
+ * Middleware para verificar si el usuario está autenticado como admin
+ * @param {Object} req - Petición HTTP
+ * @returns {Object|null} Información de la sesión si es válida, null si no
+ */
+function esAdminAutenticado(req) {
+  const sessionId = obtenerSessionIdDeCookies(req);
+  if (!sessionId) return null;
+
+  const sesion = sesionesActivas.get(sessionId);
+  if (!sesion) return null;
+
+  // Verificar expiración
+  if (sesion.expiraEn < Date.now()) {
+    sesionesActivas.delete(sessionId);
+    return null;
+  }
+
+  return sesion;
+}
+
+/**
+ * Parsea el cuerpo de una petición JSON
+ */
+
+let mysql;
+let pool;
+let databaseMode = 'local';
 
 async function initializeDatabase() {
   try {
@@ -158,13 +374,101 @@ function saveLocalData(data) {
   fs.writeFileSync(FALLBACK_FILE, JSON.stringify(data, null, 2));
 }
 
-function sendJson(response, status, data) {
-  response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+function sendJson(response, status, data, headers = {}) {
+  const allHeaders = {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+    ...headers,
+  };
+  response.writeHead(status, allHeaders);
   response.end(JSON.stringify(data));
 }
 
 function sendError(response, status, message) {
   sendJson(response, status, { message });
+}
+
+/**
+ * Maneja el endpoint de login POST /api/login
+ */
+async function handleLogin(request, response) {
+  try {
+    const body = await readBody(request);
+    const { username, password } = body;
+
+    if (!username || !password) {
+      return sendError(response, 400, 'Debes proporcionar usuario (correo) y contraseña.');
+    }
+
+    // Validar credenciales
+    const usuario = await validarCredenciales(username, password);
+    if (!usuario) {
+      return sendError(response, 401, 'Usuario o contraseña incorrectos.');
+    }
+
+    // Generar token de sesión
+    const token = generarTokenSesion();
+    crearSesion(token, usuario);
+
+    // Establecer cookie HttpOnly
+    const cookieOptions = [
+      `session_id=${token}`,
+      'HttpOnly',
+      'Path=/',
+      'SameSite=Lax',
+      `Max-Age=${Math.floor(SESION_DURACION_MS / 1000)}`,
+    ];
+
+    return sendJson(response, 200, {
+      ok: true,
+      mensaje: 'Inicio de sesión exitoso.',
+      usuario: { id: usuario.id, correo: usuario.correo },
+    }, { 'Set-Cookie': cookieOptions.join('; ') });
+  } catch (error) {
+    return sendError(response, 500, error.message || 'Error al iniciar sesión.');
+  }
+}
+
+/**
+ * Maneja el endpoint para crear admin POST /api/crear-admin
+ * Requiere autenticación previa
+ */
+async function handleCrearAdmin(request, response) {
+  try {
+    // Verificar autenticación
+    const sesion = esAdminAutenticado(request);
+    if (!sesion) {
+      return sendError(response, 403, 'No autorizado. Debes iniciar sesión como administrador.');
+    }
+
+    const body = await readBody(request);
+    const { username, password } = body;
+
+    if (!username || !password) {
+      return sendError(response, 400, 'Debes proporcionar correo y contraseña para el nuevo administrador.');
+    }
+
+    // Validar formato de correo
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(username)) {
+      return sendError(response, 400, 'El correo no es válido.');
+    }
+
+    // Validar longitud de contraseña
+    if (password.length < 6) {
+      return sendError(response, 400, 'La contraseña debe tener al menos 6 caracteres.');
+    }
+
+    // Crear usuario administrador
+    const nuevoUsuario = await crearUsuarioAdmin(username, password);
+
+    return sendJson(response, 201, {
+      ok: true,
+      mensaje: 'Administrador creado exitosamente.',
+      usuario: { id: nuevoUsuario.id, correo: nuevoUsuario.correo },
+    });
+  } catch (error) {
+    return sendError(response, error.message === 'Ya existe un usuario con ese correo.' ? 409 : 400, error.message);
+  }
 }
 
 function readBody(request) {
@@ -383,10 +687,99 @@ async function route(request, response) {
   const url = new URL(request.url, `http://${request.headers.host}`);
   const segments = url.pathname.split('/').filter(Boolean);
   try {
-    if (url.pathname === '/api/health' && request.method === 'GET') return sendJson(response, 200, { mode: databaseMode, database: DB_CONFIG.database });
-    if (segments[0] === 'api' && segments[1] === 'productos') return await routeProducts(request, response, integer(segments[2]));
-    if (segments[0] === 'api' && segments[1] === 'clientes') return await routeClients(request, response, integer(segments[2]));
-    if (segments[0] === 'api' && segments[1] === 'cotizaciones') return await routeQuotes(request, response, integer(segments[2]));
+    // Endpoint de salud (público)
+    if (url.pathname === '/api/health' && request.method === 'GET') {
+      return sendJson(response, 200, { mode: databaseMode, database: DB_CONFIG.database });
+    }
+    
+    // Endpoint de login (público)
+    if (segments[0] === 'api' && segments[1] === 'login' && request.method === 'POST') {
+      return await handleLogin(request, response);
+    }
+    
+    // Endpoint para crear admin (protegido)
+    if (segments[0] === 'api' && segments[1] === 'crear-admin' && request.method === 'POST') {
+      return await handleCrearAdmin(request, response);
+    }
+    
+    // Rutas de API protegidas para métodos de modificación
+    if (segments[0] === 'api' && segments[1] === 'productos') {
+      // POST requiere autenticación
+      if (request.method === 'POST' && !id) {
+        if (!esAdminAutenticado(request)) {
+          return sendError(response, 403, 'No autorizado. Debes iniciar sesión.');
+        }
+        return sendJson(response, 201, await createProduct(await readBody(request)));
+      }
+      // DELETE requiere autenticación
+      if (request.method === 'DELETE' && id) {
+        if (!esAdminAutenticado(request)) {
+          return sendError(response, 403, 'No autorizado. Debes iniciar sesión.');
+        }
+        await deleteProduct(id);
+        return sendJson(response, 200, { ok: true });
+      }
+      // GET es público
+      if (request.method === 'GET' && !id) {
+        return sendJson(response, 200, await listProducts());
+      }
+      return sendError(response, 405, 'Método no permitido.');
+    }
+    
+    if (segments[0] === 'api' && segments[1] === 'clientes') {
+      // POST y PUT requieren autenticación
+      if (request.method === 'POST' && !id) {
+        if (!esAdminAutenticado(request)) {
+          return sendError(response, 403, 'No autorizado. Debes iniciar sesión.');
+        }
+        return sendJson(response, 201, await createClient(await readBody(request)));
+      }
+      if (request.method === 'PUT' && id) {
+        if (!esAdminAutenticado(request)) {
+          return sendError(response, 403, 'No autorizado. Debes iniciar sesión.');
+        }
+        return sendJson(response, 200, await updateClient(id, await readBody(request)));
+      }
+      // DELETE requiere autenticación
+      if (request.method === 'DELETE' && id) {
+        if (!esAdminAutenticado(request)) {
+          return sendError(response, 403, 'No autorizado. Debes iniciar sesión.');
+        }
+        await deleteClient(id);
+        return sendJson(response, 200, { ok: true });
+      }
+      // GET es público
+      if (request.method === 'GET' && !id) {
+        return sendJson(response, 200, await listClients());
+      }
+      return sendError(response, 405, 'Método no permitido.');
+    }
+    
+    if (segments[0] === 'api' && segments[1] === 'cotizaciones') {
+      // POST requiere autenticación
+      if (request.method === 'POST' && !id) {
+        if (!esAdminAutenticado(request)) {
+          return sendError(response, 403, 'No autorizado. Debes iniciar sesión.');
+        }
+        return sendJson(response, 201, await createQuote(await readBody(request)));
+      }
+      // DELETE requiere autenticación
+      if (request.method === 'DELETE' && id) {
+        if (!esAdminAutenticado(request)) {
+          return sendError(response, 403, 'No autorizado. Debes iniciar sesión.');
+        }
+        await deleteQuote(id);
+        return sendJson(response, 200, { ok: true });
+      }
+      // GET es público
+      if (request.method === 'GET' && !id) return sendJson(response, 200, await listQuotes());
+      if (request.method === 'GET' && id) {
+        const quote = await getQuote(id);
+        return quote ? sendJson(response, 200, quote) : sendError(response, 404, 'Cotización no encontrada.');
+      }
+      return sendError(response, 405, 'Método no permitido.');
+    }
+    
     if (segments[0] === 'api') return sendError(response, 404, 'Ruta de API no encontrada.');
     return serveStatic(url.pathname, response);
   } catch (error) {

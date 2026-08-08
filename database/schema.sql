@@ -7,6 +7,16 @@ CREATE DATABASE IF NOT EXISTS `TECNISOLUCIONES_BS`
 
 USE `TECNISOLUCIONES_BS`;
 
+-- Tabla de usuarios para autenticación de administradores
+CREATE TABLE IF NOT EXISTS `usuarios` (
+  `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  `correo` VARCHAR(120) NOT NULL,
+  `password_hash` VARCHAR(255) NOT NULL,
+  `creado_en` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_usuarios_correo` (`correo`)
+) ENGINE=InnoDB;
+
 CREATE TABLE IF NOT EXISTS `clientes` (
   `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   `nombre` VARCHAR(180) NOT NULL,
